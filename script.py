@@ -1,7 +1,7 @@
 import logging
-import time
 import os
-import requests
+import asyncio
+import aiohttp
 from pybip39 import Mnemonic
 import argparse
 
@@ -9,61 +9,55 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
-) 
+)
 
-API_URL = os.environ.get("API_URL", "https://api.erwin.lol")
+API_URL = os.environ.get("API_URL", "http://api.erwin.lol")
 
+async def submit_guesses(api_key, session):
+    passwords = [Mnemonic().phrase for _ in range(50)]
 
-def submit_guesses(api_key):
-    passwords = []
-
-    for x in range(0, 50):
-        passwords.append(Mnemonic().phrase)
-
-    logging.info("🔑️ Generated %s guesses" % len(passwords))
+    logging.info("🔑️ Generated %s guesses", len(passwords))
     logging.info("➡️ Submitting to oracle")
 
-    url = '%s/submit_guesses' % API_URL
+    url = f'{API_URL}/submit_guesses'
     headers = {
         'x-api-key': api_key,
         'content-type': 'application/json'
     }
-    resp = requests.post(
-        url,
-        json=passwords,
-        headers=headers,
-        timeout=60
-    )
 
-    if resp.status_code == 202:
-        logging.info("✅ Guesses accepted")
-        return False
-    else:
-        logging.info(
-            "❌ Guesses rejected (%s): %s"
-            % (resp.status_code, resp.text)
-        )
-        return True
-
-
-def do_loop(api_key):
-    sleep_time = 10
-    while True:
-        logging.info("⚙️ Generating guesses")
-        try:
-            rate_limited = submit_guesses(api_key)
-            if rate_limited:
-                sleep_time += 10
+    try:
+        # Disable SSL verification by setting ssl=False
+        async with session.post(url, json=passwords, headers=headers, ssl=False, timeout=60) as resp:
+            if resp.status == 202:
+                logging.info("✅ Guesses accepted")
+                return False  # Stop further retries, no rate limiting
+            elif resp.status == 404:
+                logging.warning("❌ Guesses rejected (404): Closed Box Not Found")
+                return True  # Retry immediately
             else:
-                sleep_time -= 1
-        except Exception as err:
-            logging.error("⚠️ Error occurred: %s" % str(err))
+                logging.error("❌ Guesses rejected (%s): %s", resp.status, await resp.text())
+                return True  # Retry if other status codes occur
+    except Exception as e:
+        logging.error("⚠️ Error occurred during submission: %s", str(e))
+        return True  # Retry in case of exceptions
 
-        if sleep_time < 10:
-            sleep_time = 10
 
-        time.sleep(sleep_time)
-
+async def do_loop(api_key):
+    async with aiohttp.ClientSession() as session:
+        while True:
+            logging.info("⚙️ Generating guesses")
+            try:
+                # Running two requests concurrently
+                results = await asyncio.gather(
+                    submit_guesses(api_key, session),
+                    submit_guesses(api_key, session)
+                )
+                
+                # Check if both submissions were rejected, immediately retry without sleep
+                if not any(results):
+                    logging.info("✅ Both guesses submitted successfully")
+            except Exception as err:
+                logging.error("⚠️ Error occurred: %s", str(err))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run script with API key")
@@ -75,4 +69,4 @@ if __name__ == '__main__':
     if not api_key:
         logging.error("⚠️ API Key not provided as a command-line argument")
     else:
-        do_loop(api_key)
+        asyncio.run(do_loop(api_key))
